@@ -56,6 +56,7 @@ assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
 | `age-test`, `locale-age-test` | `age=3d` removes week/month/year-old MKBHD tiles; `parseAgeDays()` (pure Node, extracted from content.js) parses "…ago" in 13 languages and rejects non-dates |
 | `allowlist-test` | "Never-block" beats a full block + the pre-paint CSS + the DNR redirect; removing it re-blocks |
 | `ownpage-test` | a video-only channel's own `/videos` grid 30→0; whitelisted video survives |
+| `posts-playlists-test` | a blocked channel's playlists gone from its own Playlists tab + playlist search (both modes); its community posts gone from the Posts tab |
 | `members-test` | Join button, members-only tiles, Membership tab all gone; toggle off restores |
 | `endscreen-test`, `layout2-test`, `player-fit-test` | modern `.ytp-fullscreen-grid` neutralised; no horizontal overflow 1200–2560px; player + title above the fold |
 | `extras-test`, `ux-test` | always-on scrubs; 5 page tabs, page memory, mass-clear + tombstones |
@@ -368,15 +369,16 @@ what keeps the two paths from double-loading.
     "Members-only content" shelf and the channel Membership tab).
 
   All of the above `scrub*` / `retargetLogo` / `scrubOwnChannelPage`
-  functions (there are ~9), plus `recheckHydratingTiles()` (playlist tiles
+  functions (there are ~10), plus `recheckHydratingTiles()` (playlist tiles
   with late-hydrating bylines, and keyword tiles with late titles), run
   through the `scheduleExtrasScrub()` throttle — at most every ~400ms rather
   than on every mutation, because several full-document `querySelectorAll`
   passes per DOM write made the first page load noticeably slower. A
   `setInterval` heartbeat re-triggers the same throttle every 2s as a
   fallback, and `yt-navigate-finish` runs the batch on SPA navigation. Only
-  the blocklist-driven removals in `processRenderer()` run in the hot
-  per-mutation path (`scheduleFlush` / the `MutationObserver` callback) —
+  the blocklist-driven removals in `processRenderer()` — and `scrubPosts()`,
+  cheap because posts are rare — run in the hot per-mutation path
+  (`scheduleFlush` / the `MutationObserver` callback via `sweep()`) —
   don't add a new document-wide scan there without routing it through the
   throttle.
 
@@ -475,13 +477,16 @@ is `{ title, ts, updated_at, hidden? }`). `mode` is from
   **`scrubOwnChannelPage()`** handles that surface separately: when
   `normalizeChannelKey(location.pathname)` resolves to a blocked entry it
   treats *every* video tile on the page as that channel's and runs
-  `channelBlocks()` on it (whitelist + age honoured). A companion
+  `channelBlocks()` on it (whitelist + age honoured), and removes *every*
+  playlist tile outright (`info.isPlaylist` — a playlist has no publish
+  date, so it goes for any mode incl. age-ruled). A companion
   `<style id="bt-channel-page-hide">` (`updateChannelPageHideCSS()`, scoped
-  `ytd-browse[page-subtype="channels"]`, `:not(:has())` the whitelisted IDs,
-  skipped for age-ruled channels since CSS can't do dates) hides the grid
-  pre-paint. It's wired into `scheduleExtrasScrub()`, `yt-navigate-finish`,
-  and both blocklist-load paths; the style clears itself when you navigate
-  off the channel page. Date parsing (`parseAgeDays()`) is
+  `ytd-browse[page-subtype="channels"]`) has two clauses — the video/short
+  grid (`:not(:has())` the whitelisted IDs, skipped for age-ruled channels
+  since CSS can't do dates) and a playlist clause (`:has(PLAYLIST_LINK_SEL)`,
+  always). Wired into `scheduleExtrasScrub()`, `yt-navigate-finish`, and both
+  blocklist-load paths; the style clears itself when you navigate off the
+  channel page. Date parsing (`parseAgeDays()`) is
   language-independent (`AGE_UNITS`, ~15 languages — see "UI-language
   labels"); only `currentPageAgeDays()`'s absolute-date fallback is still
   English. `extractInfo()` only reads the date when `anyAgeRule` is true
@@ -601,12 +606,36 @@ mirrors this exactly in `updateInstantHideBlocklistCSS()`: an
 a[href*="/shorts/"]):not(:has(whitelistedLink...))` rule (one clause per such
 channel, since each has a different whitelist) rather than joining the
 single shared "hide if it has any of these links" rule used for `FULL`
-channels and individually-blocked videos. The `:has(a[href*="v="], ...)`
-clause is deliberate — it's what keeps a soft-blocked channel's own card
-(which has no video link) and its playlist tiles out of this rule; see the
-README's "Known limitations" for the playlist-tile consequence of that. An
-`EXCEPT_WHITELIST` channel that has an age rule gets **no** instant-hide
-clause at all (CSS can't do date math) — the JS scrub handles it alone.
+channels and individually-blocked videos (that shared rule's `:is()` also
+includes `POST_SELECTOR`, so a FULL channel's community posts fall to it for
+free). The `:has(a[href*="v="], ...)` clause is deliberate — it keeps a
+soft-blocked channel's own card (no video link) out of the *video* rule. A
+soft channel additionally gets, regardless of any age rule, one clause each
+for its playlists (`PLAYLIST_TILE_TAGS`, or a lockup `:has(PLAYLIST_LINK_SEL)`)
+and its posts (`:is(POST_SELECTOR):has(channelLink)`) — soft channels are
+few, so the extra clauses are cheap; FULL channels get playlists/posts from
+the shared rule and cost nothing extra. The age-ruled soft channel still
+gets **no** *video* clause (CSS can't do date math) — the JS scrub handles
+that alone.
+
+### Playlists and community posts
+
+`extractInfo()` sets `info.isPlaylist` (the tile matches `PLAYLIST_TILE_TAGS`
+or carries a `PLAYLIST_LINK_SEL` link — `list=PL…/UU…/OL…/FL…`, not
+auto-`RD…` mixes). `blockReason()` then returns "blocked" for a playlist
+tile as soon as *any* channel on it resolves via `blockedEntryFor()` —
+regardless of block mode or age rule, since a playlist has no single date.
+
+Community posts are **not** tiles (`RENDERER_SELECTOR` doesn't list them) —
+`POST_SELECTOR` (`ytd-backstage-post-thread-renderer` + friends) gets its
+own `processPost()` / `scrubPosts()` path: any `/@` or `/channel/UC` link in
+the post that resolves to a blocked entry (and none allow-listed) removes
+it, marking `data-bt-post="1"` when clear (cleared on `BLOCKLIST_UPDATED`
+and an allow-list change, like `data-bt-checked`). `scrubPosts()` is in the
+`sweep()` hot path (home-feed posts) and the `scheduleExtrasScrub()` /
+`runExtras()` / `yt-navigate-finish` backups. A `/post/…` permalink is
+covered by `findScopeForCurrentPage()` picking up the post's author for
+`checkCurrentPageAndRedirect()` (FULL bounces; soft strips in place).
 
 ### Channel identity
 
