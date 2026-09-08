@@ -14,44 +14,54 @@ can share globals via `self` without an import graph.
 
 ## Commands
 
-There is no build/lint/test tooling in this repo. The available checks are:
+The extension still has no build step. `package.json` holds only dev
+tooling (Playwright for the e2e suite, `web-ext` for Firefox), symlinked in
+from wherever `node_modules` already exists — `npm install` if it's missing.
 
 ```bash
-# Validate manifest.json is well-formed
-python3 -c "import json; json.load(open('manifest.json'))"
+# Syntax-check every script + validate manifest.json
+npm run check
 
-# Syntax-check a script (no test runner exists — this only catches parse errors)
-node --check content/content.js
-for f in background/background.js background/gist-sync.js shared/constants.js \
-         content/content.js popup/popup.js options/options.js; do node --check "$f"; done
+# End-to-end suite: real Chromium + this extension + live youtube.com.
+# Needs outbound network (youtube.com, api.github.com). ~10-15 min for all.
+npm test                        # every test/*-test.mjs, prints a PASS/FAIL summary
+node test/run.mjs settings age  # only files whose name contains these substrings
+node test/allowlist-test.mjs    # one file directly
+
+# Firefox (needs a local Firefox binary — can't run in most sandboxes)
+npm run lint:firefox            # web-ext lint
+npm run run:firefox             # launch Firefox with the extension loaded
+npm run build:firefox           # package a .zip for AMO
 ```
 
-### Live-test coverage (Playwright)
+Plain `node --check <file>` still works for a single file; `npm run check`
+just loops it over all of them and parses `manifest.json`.
 
-A large suite of end-to-end tests was written against a real Chromium +
-this extension + live youtube.com (see the harness recipe below). **The
-scripts live in `/tmp/pw-test/*-test.mjs` and are NOT in the repo** — they
-evaporate between environments; re-create them from the recipe, or ask the
-user to save them under `test/`. What each has verified (so you know what's
-already covered before re-testing):
+### Live-test coverage (`test/*-test.mjs`)
 
-| area | what's checked |
+The suite is **in the repo now** (Phase 1 of the "implement everything"
+pass moved it out of `/tmp`). Each file is standalone — launches its own
+persistent Chromium context, prints `ok:` / `FAIL:` lines, exits non-zero
+on any failure. `test/README.md` has the contract and the one known flaky
+assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
+— never the user's real `blocktube_backup*.json`.
+
+| file | what it checks |
 |---|---|
-| gist sync | SW boot with all 3 bg scripts, Sync card, `GET_SYNC_STATUS`/`SET_SYNC_CONFIG`, tombstone writes, real 401 round-trip, `gistUrl`/`remoteChannels` in status |
-| import | 4.7k-channel import in <0.5s, one bulk write, ~93 in sync chunks / rest overflow, idempotent re-import |
-| feature toggles | 12 toggles render/persist to `bt_settings`, DNR home rule added/removed per `redirectHomepage`, `removeShorts` on/off on a live search, Reset-to-defaults |
-| channel identity | UC-keyed block → 0 tiles removed (repro), then enrich → `@handle` cached → 18→0 tiles on a fresh page **and** a live open tab via `REBROADCAST_BLOCKLIST`; `ucid` captured on `@handle` entries |
-| age rule | MKBHD in search: baseline kept, `age=3d` removes week/month/year-old tiles |
-| own channel page | `@mkbhd/videos` 30→0 tiles for a video-only block; whitelisted video survives; channel-page CSS clears on nav away |
-| enrich | 8 channels (subs+@handle+name) in ~1.5s, 8-wide, one write; UC row shows `@handle` |
-| keyword filter | "iphone" removes every iphone-titled tile in search (incl. late-hydrating titles), returns when cleared |
-| undo log | single unblock + mass-clear both restore with mode/whitelist intact |
-| watch layout | no horizontal overflow at 1200–2560px; player + title both fit above the fold at 1366–2560px |
-| end screen | modern `.ytp-fullscreen-grid` neutralised, toggle off restores |
-| members / video actions / voice search / account button / search suggestions | each toggle removes/restores its target |
+| `settings-test`, `features-test`, `ui-hide-test` | 12 toggles render/persist to `bt_settings`; DNR home rule tracks `redirectHomepage`; `removeShorts` on/off live; masthead / video-actions / voice / account / search-suggestions each remove+restore |
+| `import-test`, `improve-test` | 4.7k-channel synthetic import in <0.5s, one bulk write, sync-chunk/overflow split, idempotent re-import |
+| `oldformat-debug-test` | `convertOldBlockTube()` parses the original BlockTube export shape; `?bt-debug` logs the banner + every removal's reason to the page console |
+| `uc-handle-test` | UC-keyed block → 0 tiles (repro), enrich → `@handle` cached → 18→0 on a fresh page **and** a live open tab via `REBROADCAST_BLOCKLIST` |
+| `enrich-test` | 8 channels (subs+@handle+name) in ~1.5s, 8-wide, one write |
+| `age-test`, `locale-age-test` | `age=3d` removes week/month/year-old MKBHD tiles; `parseAgeDays()` (pure Node, extracted from content.js) parses "…ago" in 13 languages and rejects non-dates |
+| `allowlist-test` | "Never-block" beats a full block + the pre-paint CSS + the DNR redirect; removing it re-blocks |
+| `ownpage-test` | a video-only channel's own `/videos` grid 30→0; whitelisted video survives |
+| `members-test` | Join button, members-only tiles, Membership tab all gone; toggle off restores |
+| `endscreen-test`, `layout2-test`, `player-fit-test` | modern `.ytp-fullscreen-grid` neutralised; no horizontal overflow 1200–2560px; player + title above the fold |
+| `extras-test`, `ux-test` | always-on scrubs; 5 page tabs, page memory, mass-clear + tombstones |
 
-Not covered by this method (no signed-in test account, Chromium only):
-masthead Create/Notifications, real Subscriptions feed, Firefox, `m.youtube.com`.
+Not covered (no signed-in test account, Chromium only): masthead
+Create/Notifications, real Subscriptions feed, Firefox, `m.youtube.com`.
 
 To actually run/verify behavior, load it in a browser:
 - **Chrome/Edge/Brave**: `chrome://extensions` → enable Developer mode → "Load unpacked" → select this folder.
@@ -181,8 +191,10 @@ what keeps the two paths from double-loading.
   than touching storage directly (also `SET_ENTRY_HIDDEN` /
   `SET_CHANNEL_AGE_RULE` — one-entry edits via the generalized
   `mutateEntry(kind, id, mutate)`, of which `mutateChannelEntry` is now just
-  an alias — and `FETCH_CHANNEL_SUBS` / `BULK_FETCH_CHANNEL_INFO`, which use
-  `applyChannelInfo()` for a batched single write). `IMPORT_BLOCKLIST` merges in memory and does one
+  an alias — `FETCH_CHANNEL_SUBS` / `BULK_FETCH_CHANNEL_INFO`, which use
+  `applyChannelInfo()` for a batched single write, and `ALLOW_CHANNEL` /
+  `DISALLOW_CHANNEL` for the `bt_allowlist` "Never-block" override — see
+  "Channel allow-list"). `IMPORT_BLOCKLIST` merges in memory and does one
   `writeFullState()` (never `addEntry`-per-entry — a multi-thousand-entry
   import would blow `chrome.storage.sync`'s write-rate quota and take minutes)
   and carries across the optional per-entry extras (`hidden`,
@@ -342,9 +354,10 @@ what keeps the two paths from double-loading.
     account, like `cleanMasthead`.
   - `hideVideoActions` → `scrubVideoActions()` (+ a CSS mirror) removes
     Share / Save / Download / Clip / Thanks / "More actions" from
-    `ytd-watch-metadata #actions`, matched by `aria-label` (English only).
-    Removing "More actions" is what takes Report out of reach. Never touches
-    the shared `ytd-menu-renderer` wrapper or the Like/Dislike buttons.
+    `ytd-watch-metadata #actions`, matched by `aria-label` via `LABELS_BY_LANG`
+    (see "UI-language labels"; English + 5 more, English fallback). Removing
+    "More actions" is what takes Report out of reach. Never touches the
+    shared `ytd-menu-renderer` wrapper or the Like/Dislike buttons.
   - `hideMemberships` → CSS hides the "Join" button (`#sponsor-button`,
     `ytd-sponsor-button-renderer`, `yt-sponsor-button-view-model`) and legacy
     `.badge-style-type-members-only` tiles; `isMembersOnlyTile()` (a tile
@@ -468,10 +481,11 @@ is `{ title, ts, updated_at, hidden? }`). `mode` is from
   skipped for age-ruled channels since CSS can't do dates) hides the grid
   pre-paint. It's wired into `scheduleExtrasScrub()`, `yt-navigate-finish`,
   and both blocklist-load paths; the style clears itself when you navigate
-  off the channel page. Date parsing (`parseAgeDays()`) is English-locale
-  only. `extractInfo()` only reads the date when
-  `anyAgeRule` is true (some blocked channel has the field), so the common
-  case pays nothing.
+  off the channel page. Date parsing (`parseAgeDays()`) is
+  language-independent (`AGE_UNITS`, ~15 languages — see "UI-language
+  labels"); only `currentPageAgeDays()`'s absolute-date fallback is still
+  English. `extractInfo()` only reads the date when `anyAgeRule` is true
+  (some blocked channel has the field), so the common case pays nothing.
 
 Other per-entry fields (channels *and* videos): `hidden` — a pure
 options-UI flag (`MSG.SET_ENTRY_HIDDEN`); the entry stays fully blocked,
@@ -492,21 +506,77 @@ options page repaints from `storage.onChanged` and pushes to the gist once
 at the end via `SYNC_NOW`. All of these fields ride the gist sync
 automatically as extra keys on the entry.
 
-### Title-keyword filters
+### Title-keyword and duration filters
 
-`chrome.storage.sync` key `bt_keywords` = `{ list: [{ p, re }], ts }` (a
-video whose title matches any pattern is scrubbed). `content.js` compiles
-them in `applyKeywords()` (loaded alongside `bt_settings`, live via
-`chrome.storage.onChanged`) and checks `matchesKeyword(info.videoTitle)` in
-`isBlocked()` + the nav guard. **JS-scrub only** — CSS can't match text — so
-there's a one-frame window vs the `:has()` layer, and `extractInfo()` now
-pulls the real title from `#video-title` (the videoId link is usually the
-title-less thumbnail anchor); `processRenderer()` leaves a keyword-relevant
-tile *unchecked* while its title hasn't hydrated, and `recheckHydratingTiles()`
-re-processes those. The options **Keywords** page tab edits the list; the
-gist merge carries `keywords` as whole-list last-write-wins on `ts`
-(`sameBlocklistCore` vs `sameBlocklist` in `gist-sync.js` — the former gates
-"apply locally", the latter "push").
+`chrome.storage.sync` key `bt_keywords` =
+`{ list: [{ p, re }], ts, durMinSec, durMaxSec }`. A video is scrubbed if
+its title matches any pattern **or** (when either bound is > 0) its duration
+badge is shorter than `durMinSec` / longer than `durMaxSec`. `content.js`
+compiles the patterns in `applyKeywords()` (loaded alongside `bt_settings`,
+live via `chrome.storage.onChanged`) into `keywordMatchers`; `blockReason()`
+(the single function `isBlocked()` delegates to — it returns a *string* so
+the debug log and the real decision can't drift) and the nav guard's
+`matchesFilter()` check both. `anyFilter()` gates the work: `extractInfo()`
+only reads the duration badge (`readDurationSec()` — scans the
+time-status/duration badges specifically, ignoring "4K"/"New") when a bound
+is set, only reads the title from `#video-title` when a keyword exists.
+**JS-scrub only** — CSS can't match text or parse a badge — so there's a
+one-frame window vs the `:has()` layer; `processRenderer()` leaves a
+keyword-relevant tile *unchecked* while its title hasn't hydrated and
+`recheckHydratingTiles()` re-processes those. The options **Keywords** page
+tab edits both (title list + a "Block videos by length" block). The gist
+merge carries the whole `keywords` object as last-write-wins on `ts`;
+`kwFingerprint()` (list + duration bounds, ts excluded) in `sameBlocklist()`
+is what makes a duration-only edit still push.
+
+### Channel allow-list ("Never-block")
+
+`chrome.storage.sync` key `bt_allowlist` =
+`{ list: { [channelKey]: { note?, ts } }, ts }` — a hard override that beats
+*every* block path: a direct block, a collaborator block, a keyword/duration
+filter, an age rule, and the DNR channel-page redirect. `@handle` keys are
+stored lowercased. Background owns the writes (`MSG.ALLOW_CHANNEL` /
+`DISALLOW_CHANNEL` → `setAllowed()`); it's carried in the `GET_BLOCKLIST` /
+`BLOCKLIST_UPDATED` payload and also read live by `content.js` via
+`chrome.storage.onChanged`. `content.js` builds `allowSet` and short-circuits
+in `blockedEntryFor()` (returns `undefined` for an allow-listed key — covers
+the nav guards and `scrubOwnChannelPage`), at the top of `blockReason()`
+(covers keyword/duration), in `checkCurrentPageAndRedirect()`, and skips the
+channel's clause in `updateInstantHideBlocklistCSS()`. `background.js`
+excludes allow-listed keys from `rebuildDnrRules()`. `gist-sync.js` syncs it
+exactly like `keywords` (LWW on `ts`, `allowFingerprint()` in
+`sameBlocklist()`). Options **Never-block** page tab + a "Never-block"
+button in the bulk-select bar manage it. A DOM node already deleted before a
+channel was allow-listed only reappears on YouTube's next re-render (same as
+unblocking) — the allow-list is not retroactive within a paint.
+
+### UI-language labels (`LABELS_BY_LANG` / `L` in content.js)
+
+Most of YouTube's chrome is matched by tag name / href / stable id — all
+locale-proof. The handful matched by visible text — the watch-page action
+buttons, masthead Create / voice search, the "Join" / "Members only"
+wording, the guide's Explore / "More from YouTube" / "Report history" — read
+from `LABELS_BY_LANG[UI_LANG]` (detected from `<html lang>` then
+`navigator.language`), with the English strings always merged in and English
+the fallback for an unlisted language. Six languages ship (en, vi, es, pt,
+fr, de); adding one is a data edit. `ariaSel()` interpolates the label lists
+into the static CSS (`cleanMasthead` / `hideVoiceSearch` / `hideVideoActions`
+selectors); the JS scrubs (`scrubVideoActions`, `scrubGuide`,
+`scrubMasthead`, `scrubMembersOnly`) build `Set`s / regexes from them.
+`parseAgeDays()` is **separate and fully language-independent**: `AGE_UNITS`
+is a `[unit-spellings-across-~15-languages, days]` table, anchored by the
+preceding `<number>` so a short token can't match inside a word
+(`locale-age-test.mjs` guards it).
+
+### Debug mode
+
+`?bt-debug` in the URL or `localStorage.bt_debug === "1"` turns on `DEBUG` in
+`content.js`. `dbg()` then logs every removal with its `blockReason()` string
+to the page console (visible under the content script's context), and
+`window.__blockTube` (isolated world — reach it via the console's JS-context
+dropdown) exposes `state()`, `why('<selector>' | element)` (runs
+`extractInfo` + reports each channel key's index resolution + the
+`blockReason` verdict), and `enable()` / `disable()`.
 
 ### Recently-unblocked undo log
 
@@ -619,10 +689,12 @@ rewrite, not a tweak here.
   that both mini-guide and drawer link to exactly `/` and `/shorts/`, note
   the trailing slash on the latter) but everything else — `HIDDEN_NAV_LABELS`
   ("Shorts" as a backup, "Explore", "More from YouTube", "Report history")
-  and `scrubMasthead()`'s Create/Notifications match — by visible
-  label/aria-label text, which is more resilient to a redesign than tag-name
-  matching but not immune (and breaks under a non-English UI, unlike the
-  href match). `navLabelOf()` reads the label off the entry's *direct child*
+  and `scrubMasthead()`'s Create match — by visible label/aria-label text.
+  These now come from `LABELS_BY_LANG` (6 languages + English fallback — see
+  "UI-language labels"), so a listed non-English UI is handled, but an
+  unlisted one still falls back to the English strings and misses. More
+  resilient to a redesign than tag-name matching, but not immune.
+  `navLabelOf()` reads the label off the entry's *direct child*
   `<a>` (`:scope > a`, deliberately not a deeper search) — confirmed live
   that a plain descendant search grabs an icon's empty wrapper `<span>`
   before it reaches the real label text, and an unscoped `querySelector("a")`
