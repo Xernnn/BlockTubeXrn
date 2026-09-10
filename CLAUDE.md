@@ -48,7 +48,7 @@ assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
 
 | file | what it checks |
 |---|---|
-| `settings-test`, `features-test`, `ui-hide-test` | 12 toggles render/persist to `bt_settings`; DNR home rule tracks `redirectHomepage`; `removeShorts` on/off live; masthead / video-actions / voice / account / search-suggestions each remove+restore |
+| `settings-test`, `features-test`, `ui-hide-test` | 32 per-element toggles render/persist to `bt_settings`; DNR home rule tracks `redirectHomepage`; Shorts on/off live; masthead / video-actions / voice / account / search-suggestions each remove+restore |
 | `import-test`, `improve-test` | 4.7k-channel synthetic import in <0.5s, one bulk write, sync-chunk/overflow split, idempotent re-import |
 | `oldformat-debug-test` | `convertOldBlockTube()` parses the original BlockTube export shape; `?bt-debug` logs the banner + every removal's reason to the page console |
 | `uc-handle-test` | UC-keyed block → 0 tiles (repro), enrich → `@handle` cached → 18→0 on a fresh page **and** a live open tab via `REBROADCAST_BLOCKLIST` |
@@ -58,8 +58,11 @@ assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
 | `ownpage-test` | a video-only channel's own `/videos` grid 30→0; whitelisted video survives |
 | `posts-playlists-test` | a blocked channel's playlists gone from its own Playlists tab + playlist search (both modes); its community posts gone from the Posts tab |
 | `members-test` | Join button, members-only tiles, Membership tab all gone; toggle off restores |
+| `channeltabs-test` | `cleanChannelTabs`: Shorts/Shows/Store/Posts/Podcasts tabs gone from a channel page, Home/Videos/Playlists kept, toggle off restores, Shorts tab still follows `removeShorts`; the modern header's Join button removed while Subscribe survives; membership price offers removed (span-split) while price-shaped video titles survive |
 | `endscreen-test`, `layout2-test`, `player-fit-test` | modern `.ytp-fullscreen-grid` neutralised; no horizontal overflow 1200–2560px; player + title above the fold |
 | `extras-test`, `ux-test` | always-on scrubs; 5 page tabs, page memory, mass-clear + tombstones |
+| `subs-ui-test` | options page: subs↓ default sort, "Show all" growing past the 300-row cap, the "No sub count" tab, auto-fetch on open, and no re-fetch of a cached count |
+| `navguard-test` | can a blocked channel still be *reached*? every channel URL shape (`/@h`, `/channel/UC…`, `/c/…`) and video URL shape (`?v=`, `&list=`, `/live/`, `/embed/`); Back after a bounce; blocking while watching; auto-resolved UC id; plus the must-still-work cases (soft mode, allow-list, unrelated channel) |
 
 Not covered (no signed-in test account, Chromium only): masthead
 Create/Notifications, real Subscriptions feed, Firefox, `m.youtube.com`.
@@ -289,91 +292,115 @@ what keeps the two paths from double-loading.
      `findScopeForCurrentPage()` (scoped to e.g.
      `ytd-watch-metadata`/`ytd-playlist-header-renderer` so it never picks
      up unrelated channels from elsewhere on the page) and `channelBlocks()`
-     (which knows about whitelist exceptions) — on load and after every
-     `yt-navigate-finish` (YouTube's SPA navigation), redirecting to
+     (which knows about whitelist exceptions) — redirecting to
      `SAFE_LANDING_URL` (Subscriptions) if blocked. `yt-navigate-start` is
      also intercepted for an earlier bounce on exact video-ID matches and on
      navigating straight to a FULL-blocked channel's page.
 
+     **It must run repeatedly, not once.** It is part of the
+     `runExtras()` batch, so the `scheduleExtrasScrub()` throttle and the 2s
+     heartbeat re-run it until the page has hydrated; the one-shot calls at
+     blocklist-load and on `yt-navigate-finish` are *not* sufficient on their
+     own, because a fresh (non-SPA) load renders its channel byline long
+     after the blocklist arrives and need not fire `yt-navigate-finish` at
+     all. That combination is exactly how a blocked channel's video used to
+     play normally. It also runs on `BLOCKLIST_UPDATED` (blocking a channel
+     while watching its video takes you off the page) and on `pageshow`
+     (`persisted`) / `popstate`, since a back/forward-cache restore re-runs
+     no script and fires no `yt-navigate-*` event.
+
+     **History matters as much as the redirect.** `bounce()` uses
+     `location.replace()` — we are standing *on* the offending page, so the
+     blocked URL must not be left in session history; with a plain
+     `location.href` assignment, Back returns to the blocked page (and, now
+     that the check repeats, bounces forward again, so Back looks broken).
+     The `yt-navigate-start` guards are the opposite case — they fire while
+     the *innocent* referring page is still current, so they deliberately
+     push instead, and the blocked URL never enters history at all.
+
+     URL shapes: a video is reachable as `?v=<id>`, `/shorts/<id>`,
+     `/live/<id>`, `/embed/<id>` and `/v/<id>`, and a channel as `/@handle`,
+     `/channel/UC…`, `/c/<name>` and `/user/<name>` — all of which the guard
+     and the DNR rules must cover, not just the canonical two.
+     `pageIdentityKeys()` reads the page's own `<link rel="canonical">` /
+     `<meta itemprop>` / channel header so a block matches whichever identity
+     format the URL carries (see "Channel identity"). `/embed/<id>` is the
+     one page with no readable byline at all — nothing on it names the
+     uploader — so a videoId with no channel in scope is resolved through
+     `MSG.RESOLVE_VIDEO_CHANNEL` (background, YouTube's public oEmbed
+     endpoint, cached per video id).
+
   Separately, `content/content.js` also enforces things that are **not**
-  blocklist-driven. Each is gated on a **feature toggle** in
-  `settings` (`shared/constants.js` `DEFAULT_SETTINGS`, stored as one object
-  in `chrome.storage.sync` under `SETTINGS_KEY` / `bt_settings`, all default
-  `true`). `applySettings()` merges the stored object over the defaults,
-  rebuilds the static instant-hide stylesheet (`buildStaticCSS()` joins only
-  the `STATIC_CSS_PARTS` whose toggle is on) plus the blocklist half, and —
-  on a *live* change — re-runs `runExtras()`. The startup `runExtras()` is
-  deferred until `chrome.storage.sync.get` resolves (`settingsLoaded`),
-  because a `remove*` a user has turned off must not fire its irreversible
-  `.remove()` once before their settings arrive. `chrome.storage.onChanged`
-  keeps it live. Blocklist enforcement itself has no toggle — it's the point
-  of the extension. The toggles and what they gate:
-  - `removeShorts` → `scrubShorts()` deletes every Shorts shelf, shelf tile,
-    and the full-screen player (plus the `/shorts/*` and `reelWatchEndpoint`
-    redirects in the nav guards, and the `DNR_RULE_ID_SHORTS` network rule).
-  - `cleanSidebar` → `scrubGuide()` removes Home/Shorts from the sidebar by
-    matching their link (`a[href="/"]` / `a[href="/shorts"]`, scoped to the
-    guide containers only — *not* document-wide, to avoid the masthead logo's
-    own `href="/"`), and "Explore"/"More from YouTube"/"Report history" by
-    visible label text. Also the sidebar's small-print footer.
-  - `cleanMasthead` → `scrubMasthead()` removes the Create and Notifications
-    buttons, matched by aria-label/title text.
-  - `removeRelated` → `scrubSideRecommendations()` deletes the whole
-    `#secondary` column beside the player; the reflow CSS in the toggle-driven
-    `<style>` caps `#primary` at
-    `min(100%, max(426px, calc((100vh - 144px) * 16/9)))` — wide enough to use
-    the freed space, but bounded so a 16:9 player's height stays under
-    `viewport − masthead − title`, i.e. the player *and* the title still fit
-    above the fold (going full-width made the player taller than the viewport
-    on wide screens). The inner chain (`#player-container` etc.) is forced to
-    fill that capped column with zero right padding (YouTube's JS had sized it
-    for the 2-column layout, leaving a right gap), and `overflow-x: clip` on
-    `ytd-app` stops the page ever scrolling sideways — without that, at some
-    widths a scrollbar appears and arrow keys pan the page instead of seeking.
-    `[theater]` is left alone.
-  - `hideSearchSuggestions` → CSS only: hides the search autocomplete dropdown
-    (`.ytSearchboxComponentSuggestionsContainer` new / `ytd-search-suggestions-section`
-    + `tp-yt-paper-listbox#suggestions` legacy).
-  - `removeEndScreen` → `scrubEndScreen()` + CSS kill the end-of-video
-    suggestion grid and in-player cards. YouTube renamed these once already
-    (`.html5-endscreen`/`.ytp-videowall-still` → `.ytp-fullscreen-grid`/
-    `.ytp-modern-videowall-still`); both name sets are handled — see "Known
-    fragility" for the details and how to re-probe.
-  - `logoToSubscriptions` → `retargetLogo()` rewrites the masthead
-    YouTube-logo anchor's `href` to `SAFE_LANDING_URL` (scoped to the
-    masthead so it never hits the guide's own Home link).
-  - `redirectHomepage` → the `/` → Subscriptions redirect: the
-    `DNR_RULE_ID_HOME` network rule (background.js, added only when the
-    toggle is on) plus `checkCurrentPageAndRedirect()` / `yt-navigate-start`
-    (which also bounce `browseId === "FEwhat_to_watch"` so an SPA logo click
-    has no home-feed flash — gated on `redirectHomepage || logoToSubscriptions`).
-  - `hideVoiceSearch` → CSS only: `#voice-search-button` + the
-    `[aria-label="Search with your voice"]` mic button.
-  - `accountButtonOnHover` → CSS only: `ytd-masthead …:has(#avatar-btn)` gets
-    `opacity:0`, back to `1` on `ytd-masthead #end:hover`. Nothing to hide
-    when signed out (no `#avatar-btn`), so unverifiable without a test
-    account, like `cleanMasthead`.
-  - `hideVideoActions` → `scrubVideoActions()` (+ a CSS mirror) removes
-    Share / Save / Download / Clip / Thanks / "More actions" from
-    `ytd-watch-metadata #actions`, matched by `aria-label` via `LABELS_BY_LANG`
-    (see "UI-language labels"; English + 5 more, English fallback). Removing
-    "More actions" is what takes Report out of reach. Never touches the
-    shared `ytd-menu-renderer` wrapper or the Like/Dislike buttons.
-  - `hideMemberships` → CSS hides the "Join" button (`#sponsor-button`,
-    `ytd-sponsor-button-renderer`, `yt-sponsor-button-view-model`) and legacy
-    `.badge-style-type-members-only` tiles; `isMembersOnlyTile()` (a tile
-    with a badge whose text is exactly "Members only" — text-matched because
-    the new `badge-shape` class `ytBadgeShapeCommerce` is shared with other
-    paid badges) is checked in `processRenderer()` for instant removal and in
-    the throttled `scrubMembersOnly()` (which also removes a "Membership" /
-    "Members-only content" shelf and the channel Membership tab).
+  blocklist-driven. Each is gated on its own **feature toggle**, and the
+  toggles are a two-level tree (`SETTING_GROUPS` in `shared/constants.js`):
+  six groups, and **one leaf per thing removed** — 32 of them. Only leaves are
+  stored (flat, in `chrome.storage.sync` under `SETTINGS_KEY` / `bt_settings`,
+  all default `true`); a group's master switch in the options UI is *derived*
+  from its leaves, never persisted, so it cannot disagree with what is applied.
+  `resolveSettings(stored)` merges over `DEFAULT_SETTINGS` and expands
+  `LEGACY_SETTING_MAP` — the coarse per-surface keys an older version wrote
+  (`cleanSidebar`, `hideVideoActions`, `hideMemberships`, `cleanChannelTabs`,
+  `cleanMasthead`, `removeShorts`) — so an upgrade keeps a user's disabled
+  features off instead of silently switching them back on. `applySettings()`
+  goes through it, rebuilds the static instant-hide stylesheet
+  (`buildStaticCSS()` joins the `STATIC_CSS_PARTS` whose **leaf** key is on,
+  so the CSS layer is per-element too) plus the blocklist half, and — on a
+  *live* change — re-runs `runExtras()`. The startup `runExtras()` is deferred
+  until `chrome.storage.sync.get` resolves (`settingsLoaded`), because a
+  `remove*` a user has turned off must not fire its irreversible `.remove()`
+  once before their settings arrive. `chrome.storage.onChanged` keeps it live.
+  Blocklist enforcement itself has no toggle — it's the point of the extension.
+
+  A scrub that covers several leaves bails early only when *nothing* in its
+  group is on (`anyOn(KEYS)`), then re-checks the specific key at each place it
+  acts — `activeNavLabels()` / `activeActionLabels()` rebuild their match sets
+  per call for exactly that reason. The groups and what they gate:
+  - **Shorts** — `shortsFeedTiles` (shelves/tiles, and the CSS part),
+    `shortsPlayer` (the full-screen player, the `/shorts/*` and
+    `reelWatchEndpoint` nav guards, and the `DNR_RULE_ID_SHORTS` network rule),
+    `shortsChannelTab`.
+  - **Home page and navigation** — `redirectHomepage` (the `/` → Subscriptions
+    bounce: `DNR_RULE_ID_HOME` plus the nav guards), `logoToSubscriptions`
+    (`retargetLogo()`).
+  - **Left sidebar** — `sidebarHome` / `sidebarShorts` (matched by link, not
+    label), `sidebarExplore`, `sidebarMoreFromYouTube`, `sidebarReportHistory`,
+    `sidebarFooter`.
+  - **Top bar** — `mastheadCreate`, `mastheadNotifications`, `hideVoiceSearch`,
+    `hideSearchSuggestions`, `accountButtonOnHover`.
+  - **Watch page** — `removeRelated` (plus the reflow CSS described below),
+    `removeEndScreen`, and one leaf per action button: `actionShare`,
+    `actionSave`, `actionDownload`, `actionClip`, `actionThanks`, `actionMore`
+    (Report rides with More, since removing the overflow menu is what puts it
+    out of reach).
+  - **Channel page** — `joinButton`, `membershipPrices`, `membersOnlyTiles`,
+    `membershipTab`, `tabPosts`, `tabShows`, `tabPodcasts`, `tabStore`.
+
+  `removeRelated`'s reflow CSS caps `#primary` at
+  `min(100%, max(426px, calc((100vh - 144px) * 16/9)))` — wide enough to use
+  the freed space, but bounded so a 16:9 player's height stays under
+  `viewport − masthead − title`, i.e. the player *and* the title still fit
+  above the fold (going full-width made the player taller than the viewport on
+  wide screens). The inner chain (`#player-container` etc.) is forced to fill
+  that capped column with zero right padding (YouTube's JS had sized it for the
+  2-column layout, leaving a right gap), and `overflow-x: clip` on `ytd-app`
+  stops the page ever scrolling sideways — without that, at some widths a
+  scrollbar appears and arrow keys pan the page instead of seeking.
+  `[theater]` is left alone.
 
   All of the above `scrub*` / `retargetLogo` / `scrubOwnChannelPage`
-  functions (there are ~10), plus `recheckHydratingTiles()` (playlist tiles
-  with late-hydrating bylines, and keyword tiles with late titles), run
-  through the `scheduleExtrasScrub()` throttle — at most every ~400ms rather
-  than on every mutation, because several full-document `querySelectorAll`
-  passes per DOM write made the first page load noticeably slower. A
+  functions (there are ~10) plus `checkCurrentPageAndRedirect()` live in
+  **`runExtras()`**, and `recheckHydratingTiles()` (playlist tiles with
+  late-hydrating bylines, and keyword tiles with late titles) alongside it,
+  run through the `scheduleExtrasScrub()` throttle — at most every ~400ms
+  rather than on every mutation, because several full-document
+  `querySelectorAll` passes per DOM write made the first page load
+  noticeably slower.
+
+  **Keep that list in exactly one place.** `scheduleExtrasScrub()` and the
+  `yt-navigate-finish` handler both *call* `runExtras()`; they used to repeat
+  its contents inline instead, and anything added to only one of the three
+  copies silently never ran on a normal page load — that is precisely how the
+  page-redirect check ended up dead on fresh loads while looking wired up. A
   `setInterval` heartbeat re-triggers the same throttle every 2s as a
   fallback, and `yt-navigate-finish` runs the batch on SPA navigation. Only
   the blocklist-driven removals in `processRenderer()` — and `scrubPosts()`,
@@ -395,22 +422,43 @@ what keeps the two paths from double-loading.
 - **`options/`** — full blocklist manager (search, unblock, JSON
   export/import) opened via `chrome.runtime.openOptionsPage()`. Listens to
   `chrome.storage.onChanged` to live-refresh (debounced ~300ms;
-  `suppressStorageRefresh` mutes it during a bulk sub-count load). Four
-  **top-level page tabs** (`.page-tab` → `showPage()` toggles the `.page`
-  divs `#page-blocklist` / `#page-keywords` / `#page-settings` / `#page-sync`;
-  last one remembered in `localStorage`), so the keyword list, toggle card
-  and gist card aren't in the way of the list. The content column is ~1120px wide. Within
+  `suppressStorageRefresh` mutes it during a bulk sub-count load). The page is a
+  two-column shell: a sticky `.sidenav` (brand, five `.page-tab` buttons with
+  live count badges, a footer note) beside a `.main` column holding `.wrap`.
+  `showPage()` toggles the `.page` divs `#page-blocklist` / `#page-keywords` /
+  `#page-allowlist` / `#page-settings` / `#page-sync`, last one remembered in
+  `localStorage`. Under 860px the rail collapses to a horizontal icon strip.
+  Every colour is a CSS custom property defined once on `:root`, with a
+  `prefers-color-scheme: dark` block redefining **only** the tokens — no rule
+  hard-codes a colour. Within
   Blocklist, **filter tabs** (`.filter-tab`, `tab` state) narrow to All /
-  full channels / video-only channels / videos / **Hidden**; `RENDER_CAP`
-  (300) bounds rows per section. Each row has a **Hide** button
-  (`buildHideBtn` → `SET_ENTRY_HIDDEN`); the video section has a
+  full channels / video-only channels / videos / **No sub count** / **Hidden**
+  ("No sub count" = `subsToNumber(e.subs) == null`, so it gathers the never-
+  fetched *and* the ones whose count is hidden or came back "n/a" — exactly
+  the rows the subs sort can't place and the size filter can't judge). Lists
+  render `RENDER_CAP` (300) rows and then **grow** — `renderList()`'s
+  `#…-more` line carries "Show N more" / "Show all", stepping `shown[key]` by
+  `RENDER_STEP`. It is a cap, not a truncation: the whole blocklist has to be
+  reachable by scrolling, not only by guessing a search term. `resetShown()`
+  runs whenever the visible set changes (tab / search / sort) so a list never
+  opens mid-way down. Rows are **two lines**: the
+  channel/video name on its own, then a quiet `.row-meta` line carrying the
+  `@handle`/id, the subs chip, the block-mode badge and any "local only" tag —
+  a row gets scanned far more often than it gets acted on, and eight controls
+  competing on one line is what made the list unreadable. The right-hand
+  `.row-actions` column holds only **Unblock** plus a **⋯** disclosure; ⋯
+  opens `.row-drawer`, which holds **Hide** (`buildHideBtn` →
+  `SET_ENTRY_HIDDEN`), the mode switch, and — for a video-only channel — the
+  whitelist/age editor. Because the actions column is fixed-width, the buttons
+  line up down the list instead of landing at a different x on every row. the video section has a
   **"Clear all N blocked videos"** button (`#clear-videos-btn` →
   `CLEAR_BLOCKED_VIDEOS`, a single bulk write + a tombstone per video) with an
   undo entry in the **Recently unblocked** `<details>` below it; a
-  video-only channel's whitelist/age panel is a `<details>` collapsed by
-  default so a page of them stays short. Channel rows show a subscriber-count
-  chip (`buildSubsChip` → `FETCH_CHANNEL_SUBS` for one, cached on the entry,
-  stale after 30d) and — once known — the channel's **`@handle`** in place of
+  video-only channel's whitelist/age panel is a `<details>` inside that drawer,
+  so a page of them stays short. Channel rows show a subscriber-count
+  chip (`buildSubsChip` → `FETCH_CHANNEL_SUBS` for one, cached on the entry
+  **permanently** — there is deliberately no staleness window; see
+  "Subscriber counts are fetched once" below) and — once known — the channel's **`@handle`** in place of
   the raw `UC…` id (a channel keyed by `@handle` shows no separate id line at
   all; the `UC…` becomes a tooltip). `bulkFetchSubs()` batches ids (40 each)
   into `BULK_FETCH_CHANNEL_INFO` messages, two in flight; each message
@@ -420,16 +468,33 @@ what keeps the two paths from double-loading.
   a real `entry.name`. Button doubles as Stop, mutes the storage-refresh
   meanwhile, fires one `SYNC_NOW` at the end. "Load sub counts"
   (`#load-subs-btn`) does the rendered rows, "Fetch all sub counts"
-  (`#fetch-all-subs-btn`) the whole blocklist (resumable — skips fresh
-  counts); a successful **import** offers to run the whole-blocklist sweep. A **Sort** select
+  (`#fetch-all-subs-btn`) the whole blocklist (resumable — skips channels
+  already attempted); a successful **import** offers to run the
+  whole-blocklist sweep. A **Sort** select
   (`sortBy`: recent / subs↓ / subs↑ / name — `subsToNumber()` parses
-  "1.2M"-style strings, unknowns sort last) and a **"Hide channels under N
+  "1.2M"-style strings, unknowns sort last; **defaults to subs↓**, and the
+  `selected` attribute in `options.html` must track that default) and a **"Hide channels under N
   subs"** view filter (`hideSmall` / `smallThreshold`, unknown counts kept)
-  sit above the channel list. The **"What this extension changes"** card
-  (`#settings-card`, `SETTING_DEFS` → `renderSettings()`) is the 12 feature
-  toggles as switches, writing `bt_settings` to `chrome.storage.sync` on
-  every flip, plus Reset-to-defaults; it live-updates from
-  `chrome.storage.onChanged`. Also hosts the **Sync** card (`#sync-card`,
+  sit above the channel list. The **"What gets hidden"** page
+  (`#settings-list`, `SETTING_GROUPS` → `renderSettings()`) renders the toggle
+  tree: one `.sgroup` card per group, a `.group-toggle` master in its header,
+  and one `.switch` per leaf. The master is **derived** — checked when every
+  leaf in the group is on, cleared when none are, `indeterminate` in between —
+  and clicking it writes every leaf in that group. No group state is stored, so
+  a master can never claim a group is on while a leaf inside it is off.
+  `#settings-search` filters by group and item text. Writes land in
+  `bt_settings` on every flip; it live-updates from `chrome.storage.onChanged`.
+  **Count contract:** `#settings-list .switch` is exactly the leaves (32) —
+  masters use `.group-toggle` precisely so they don't inflate it. Each switch
+  carries **`data-key="<setting>"`** and every test must select through it —
+  `nth(11)` and hand-maintained mirrors of the settings order are how adding a
+  setting silently re-points a test at the wrong switch, so the failure lands
+  on an unrelated assertion (adding `cleanChannelTabs` once made `layout2-test`
+  report "autocomplete did not return"). Adding a setting means: a leaf in
+  `SETTING_GROUPS`, the gating code in `content.js`, and the toggle-count
+  assertions in `settings` / `ui-hide` / `members` / `ux` / `layout2`. Those
+  tests' `setToggle()` takes a key **or an array of keys**, so a former coarse
+  toggle is flipped as its group of leaves. Also hosts the **Sync** card (`#sync-card`,
   `initSync()`) — paste a GitHub PAT to connect, "Sync now" / "Disconnect this
   device", and a status block from `GET_SYNC_STATUS` showing the synced
   channel/video counts, a link to the gist, and a "paste the same token on
@@ -446,8 +511,9 @@ what keeps the two paths from double-loading.
   (`CHUNK_SIZE`, `MAX_SYNC_ITEMS`, key prefixes, plus `TOMBSTONE_KEY` /
   `TOMBSTONE_TTL_MS` / `SYNC_KEY`), the gist-sync config block (`SYNC.*` —
   gist filename, poll period, push debounce), and the feature-toggle
-  contract (`SETTINGS_KEY` = `bt_settings`, `DEFAULT_SETTINGS` = 12 booleans
-  all `true`). Loaded as a plain script
+  contract — `SETTINGS_KEY` = `bt_settings`, `SETTING_GROUPS` (the two-level
+  toggle tree), `DEFAULT_SETTINGS` (32 leaf booleans, derived from the tree,
+  all `true`), `LEGACY_SETTING_MAP` and `resolveSettings()`. Loaded as a plain script
   everywhere (`importScripts` in the service worker, `<script src>` in HTML
   pages, first entry in `content_scripts.js`) and attaches to `self`.
 
@@ -637,6 +703,35 @@ and an allow-list change, like `data-bt-checked`). `scrubPosts()` is in the
 covered by `findScopeForCurrentPage()` picking up the post's author for
 `checkCurrentPageAndRedirect()` (FULL bounces; soft strips in place).
 
+### Subscriber counts are fetched once
+
+Opening the options page kicks off `autoFetchMissingSubs()`, which runs the
+normal `bulkFetchSubs()` job over every channel with **no recorded attempt**
+and ends, like every other bulk run, with one `SYNC_NOW` — so the counts,
+`@handle`s and real names land in the gist without anyone pressing a button.
+
+The gate is `subsAttempted(entry)` (`!!entry.subsAt`), **not** "has a count":
+
+- A cached count is kept forever — there is no staleness window. Sub counts
+  drift slowly and nothing in the extension depends on them being current, so
+  re-scraping thousands of channel pages on a timer buys a rounded "12.4M"
+  that was already right, at the price of a long sweep and YouTube
+  rate-limiting. Clicking a chip still forces a refresh for that one channel.
+- A channel that *hides* its count, or has none, records `subsAt` with no
+  `subs`, so it is not retried on every open forever — it just sits in the
+  **No sub count** tab.
+- A hard fetch failure records nothing (`BULK_FETCH_CHANNEL_INFO` only writes
+  channels whose scrape returned something), so genuinely transient errors —
+  offline, rate-limited — *are* retried next time.
+
+That combination is what makes the auto-fetch self-limiting: it does real
+work on the first open after an import and nothing at all on later opens.
+Because it is the ordinary bulk job, the "Fetch all sub counts" button still
+doubles as Stop while it runs, and it resumes where it left off. Note that
+the enrichment is worth having beyond the numbers: a `UC…`-keyed channel does
+not block modern feed tiles until its `@handle` is known (see "Channel
+identity").
+
 ### Channel identity
 
 A channel is keyed either by its canonical ID (`UCxxxxxxxxxxxxxxxxxxxxxx`,
@@ -659,6 +754,28 @@ imported `UC…` list must be enriched to actually block** — the post-import p
 bulk enrich ends with `REBROADCAST_BLOCKLIST` so open tabs pick up the new
 handles without a reload. Blocking directly from a channel's own page (via
 the popup) still captures the format the page shows.
+
+`MSG.BLOCK_CHANNEL` now resolves the *other* identity itself:
+`enrichChannelIdentity()` scrapes the channel once, fire-and-forget (the
+block must not wait on the network), and rebroadcasts — so a channel blocked
+by `@handle` also blocks `/channel/UC…` (and gets a DNR rule for both, see
+`rebuildDnrRules()`) without waiting for a sub-count sweep. It is
+best-effort: offline, rate-limited, or a service worker torn down mid-fetch
+just leaves the entry keyed as it was, and `pageIdentityKeys()` in
+`content.js` still bridges the formats from the page's own metadata.
+
+**Identity parsing is a trap.** `parseChannelHtml()` must take the UC id and
+handle only from sources that describe *the page itself* — `<link
+rel="canonical">`, `<meta itemprop>`, `"externalId"`, `"vanityChannelUrl"`.
+A channel page embeds shelves of other people's videos, each carrying its
+own `"channelId"` / `"canonicalBaseUrl"`, and `scrapeChannelInfo()`
+deliberately stops reading ~1MB in, *before* the authoritative
+`"externalId"` near the end of the document. Leading the match list with the
+ambiguous keys therefore recorded a **stranger's** UC id on the entry — which
+then cross-indexed the blocklist and generated a DNR redirect against an
+innocent channel. `verifyChannelInfo()` is the backstop: if a fetch of
+`/@foo` comes back claiming a different handle, the handle and ucid are
+dropped (subs/name, being cosmetic, are kept).
 
 ### Sync: two layers
 
@@ -684,6 +801,23 @@ rewrite, not a tweak here.
 
 ## Known fragility
 
+- **Not covered at all: `music.youtube.com`.** `content_scripts.matches` is
+  `www.youtube.com` + `m.youtube.com` only, so a blocked channel's music and
+  videos are fully reachable there. Adding it is not a one-line manifest
+  edit — YouTube Music's DOM shares almost nothing with the `ytd-*` tags
+  `RENDERER_SELECTOR` targets.
+- **Not covered: third-party embeds.** The content script has no
+  `all_frames`, and the DNR rules are `resourceTypes: ["main_frame"]`, so a
+  blocked video embedded in an `<iframe>` on someone else's site plays. A
+  top-level `youtube.com/embed/<id>` *is* handled (via
+  `MSG.RESOLVE_VIDEO_CHANNEL`). Extending to iframes means `all_frames: true`
+  plus `sub_frame` in the DNR conditions — deliberately not done, since it
+  changes behaviour on every site the user visits, not just YouTube.
+- `MSG.RESOLVE_VIDEO_CHANNEL` depends on YouTube's public **oEmbed** endpoint
+  (`/oembed?format=json&url=…`, no API key) staying available and returning
+  `author_url`. It is only consulted for a page that shows a player but no
+  channel byline (in practice `/embed/<id>`), and misses are cached, so a
+  breakage degrades to "embed pages stop being guarded", not an error.
 - `manifest.json` declares the `contextMenus` permission, but nothing calls
   `chrome.contextMenus.*` anywhere — it's a leftover. Safe to drop, or to
   build the right-click "block this" entry it was presumably reserved for.
@@ -708,6 +842,26 @@ rewrite, not a tweak here.
   or the legacy tags disappear entirely, that's the pairing to revisit. This
   was the real cause of "a blocked channel's playlist still shows up", not
   the hydration-timing theory that shipped first.
+- `findScopeForCurrentPage()` decides *whose page this is*, and it cannot be
+  a flat "first selector that matches anything" chain — that shape is what
+  left a blocked channel's **playlist pages reachable**. Two compounding
+  traps, both confirmed live on `/playlist`:
+  1. **YouTube leaves other page types' components mounted as empty shells**
+     after an SPA navigation. A `/playlist` page still contains a childless
+     `ytd-watch-metadata`, which won the old chain and duly reported "no
+     channel here" — the real owner byline was never consulted.
+  2. **Even within one page type the first match can be the empty one**: a
+     `/playlist` page has two `yt-page-header-renderer`s and only one carries
+     the byline. (That component is where the owner moved to; the legacy
+     `ytd-playlist-header-renderer` / `-sidebar-primary-info-renderer` still
+     render, but empty.)
+
+  So the function restricts candidates by `location.pathname` first, then
+  prefers the first candidate that actually contains a channel link, falling
+  back to a bare match only if none do. Add a surface the same way — and note
+  that a *wrong* answer here is a false bounce off a page the user is
+  entitled to, which is why `navguard-test` asserts the home feed, search
+  results, an unrelated channel's video and Subscriptions itself all stay put.
 - `RENDERER_SELECTOR`, `SHELF_SELECTOR`, and `findScopeForCurrentPage()` in
   `content/content.js` hard-code YouTube's current custom-element tag names
   (`ytd-*` desktop, `ytm-*` mobile). YouTube changes these periodically —
