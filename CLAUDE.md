@@ -48,7 +48,7 @@ assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
 
 | file | what it checks |
 |---|---|
-| `settings-test`, `features-test`, `ui-hide-test` | 32 per-element toggles render/persist to `bt_settings`; DNR home rule tracks `redirectHomepage`; Shorts on/off live; masthead / video-actions / voice / account / search-suggestions each remove+restore |
+| `settings-test`, `features-test`, `ui-hide-test` | 33 per-element toggles render/persist (32 on by default — `blockInEmbeds` is opt-in) to `bt_settings`; DNR home rule tracks `redirectHomepage`; Shorts on/off live; masthead / video-actions / voice / account / search-suggestions each remove+restore |
 | `import-test`, `improve-test` | 4.7k-channel synthetic import in <0.5s, one bulk write, sync-chunk/overflow split, idempotent re-import |
 | `oldformat-debug-test` | `convertOldBlockTube()` parses the original BlockTube export shape; `?bt-debug` logs the banner + every removal's reason to the page console |
 | `uc-handle-test` | UC-keyed block → 0 tiles (repro), enrich → `@handle` cached → 18→0 on a fresh page **and** a live open tab via `REBROADCAST_BLOCKLIST` |
@@ -62,6 +62,12 @@ assertion (`settings-test` "removeShorts on"). Uses **synthetic data only**
 | `endscreen-test`, `layout2-test`, `player-fit-test` | modern `.ytp-fullscreen-grid` neutralised; no horizontal overflow 1200–2560px; player + title above the fold |
 | `extras-test`, `ux-test` | always-on scrubs; 5 page tabs, page memory, mass-clear + tombstones |
 | `subs-ui-test` | options page: subs↓ default sort, "Show all" growing past the 300-row cap, the "No sub count" tab, auto-fetch on open, and no re-fetch of a cached count |
+| `popup-test` | popup counters + its off-YouTube state + "Manage blocklist"; and the contract its buttons rest on — `GET_PAGE_TARGET` returns one row per real channel, never the same channel under both identity formats (the `withAliases` split) |
+| `bulkactions-test` | the bulk-select bar end to end: Hide / Video-only / Never-block / Unblock across a selection, and that bulk Unblock stays undoable |
+| `duration-test` | the duration half of the keyword filter (shorter-than / longer-than bounds read off the real time badge, not "4K"/"New"), regex keywords, and that a malformed regex doesn't take the page down |
+| `contextmenu-test` | pure Node: `ctxTargetFrom()` + its regexes lifted out of background.js — every video/channel URL shape resolves, `/c/` `/user/` home and search resolve to *nothing*, link beats page URL, menus scoped to youtube.com |
+| `embeds-test` | `blockInEmbeds`: a youtube.com/embed iframe on a third-party page is untouched by default, blanked once opted in, and an unblocked channel's embed still plays |
+| `feedloop-test` | the runaway-feed curb: a fully-blocked feed stops fetching and stays small, while an unblocked and a partially-blocked feed both still page normally on scroll |
 | `navguard-test` | can a blocked channel still be *reached*? every channel URL shape (`/@h`, `/channel/UC…`, `/c/…`) and video URL shape (`?v=`, `&list=`, `/live/`, `/embed/`); Back after a bounce; blocking while watching; auto-resolved UC id; plus the must-still-work cases (soft mode, allow-list, unrelated channel) |
 
 Not covered (no signed-in test account, Chromium only): masthead
@@ -245,10 +251,17 @@ what keeps the two paths from double-loading.
      dynamic rule rebuilt by `updateInstantHideBlocklistCSS()` every time
      the blocklist loads/changes, using `:has()` to match any tile
      containing a blocked channel/video link — but only for the
-     `INSTANT_HIDE_MAX_CHANNELS` (1500) / `INSTANT_HIDE_MAX_VIDEOS` (500)
-     *most recently blocked* (`newestFirst()`), since one `:has()` with a few
-     thousand `a[href]` selectors is re-evaluated on every style recalc; the
-     rest rely on the one-frame-later JS scrub. Because `:has()` is
+     `INSTANT_HIDE_MAX_CHANNELS` (400) / `INSTANT_HIDE_MAX_VIDEOS` (250)
+     *most recently blocked* (`newestFirst()`). **That cap is a measured
+     performance budget, not a guess.** The browser re-evaluates the whole
+     selector list on every style recalc, continuously, on every page, whether
+     or not any of those channels is present — scrolling a search page for
+     ~11s cost 0.05s of style recalc with the extension off, 0.21s at 400
+     channels, and **0.86s at the old cap of 1500** (23% CPU against a 15%
+     baseline). Entries past the cap lose only the pre-paint hide, never the
+     block: the JS scrub still removes them a frame later, and they are the
+     least recently blocked, so the ones you are least likely to meet.
+     Raising it back up is a real, measurable tax on every page. Because `:has()` is
      matched continuously by the browser's style engine as part of normal
      layout — not by a JS callback reacting after the fact — this hides a
      tile before the `MutationObserver` below would ever get a turn to run,
@@ -333,9 +346,11 @@ what keeps the two paths from double-loading.
   Separately, `content/content.js` also enforces things that are **not**
   blocklist-driven. Each is gated on its own **feature toggle**, and the
   toggles are a two-level tree (`SETTING_GROUPS` in `shared/constants.js`):
-  six groups, and **one leaf per thing removed** — 32 of them. Only leaves are
-  stored (flat, in `chrome.storage.sync` under `SETTINGS_KEY` / `bt_settings`,
-  all default `true`); a group's master switch in the options UI is *derived*
+  seven groups, and **one leaf per thing removed** — 33 of them. Only leaves are
+  stored (flat, in `chrome.storage.sync` under `SETTINGS_KEY` / `bt_settings`).
+  All default `true` **except `blockInEmbeds`**, which ships off because it is
+  the only leaf that affects sites other than YouTube; a leaf opts out with
+  `default: false` in the tree and `DEFAULT_SETTINGS` is derived from that; a group's master switch in the options UI is *derived*
   from its leaves, never persisted, so it cannot disagree with what is applied.
   `resolveSettings(stored)` merges over `DEFAULT_SETTINGS` and expands
   `LEGACY_SETTING_MAP` — the coarse per-surface keys an older version wrote
@@ -415,9 +430,19 @@ what keeps the two paths from double-loading.
   change both if it ever needs to move.
 
 - **`popup/`** — quick-block UI for the tab you're currently on. Asks the
-  content script for `GET_PAGE_TARGET` (current video + all channels found
+  content script for `GET_PAGE_TARGET` (current video + the channels found
   in scope) and renders both block-mode buttons per channel (see "Channel
-  block modes" below), same as the hover menu.
+  block modes" below), same as the hover menu. It renders **one row per
+  returned channel**, which is why `getCurrentPageTarget(withAliases)` splits:
+  the nav guard passes `true` and wants every identity format it can find (more
+  chances to match however an entry is keyed), the popup passes nothing and
+  wants one row per real channel. Without that split a watch page returned both
+  `@handle` and `UC…` for the *same* channel and the popup offered to block it
+  twice — the byline holds only `/@handle`, but the **description** carries
+  `/channel/UC…/videos` and `/about` links, so collecting from the whole
+  metadata swept up the other format. The popup path therefore narrows to
+  `OWNER_BYLINE_SEL` first; collaborators are all in that byline, so genuine
+  multi-channel videos still get a row each. `popup-test` guards it.
 
 - **`options/`** — full blocklist manager (search, unblock, JSON
   export/import) opened via `chrome.runtime.openOptionsPage()`. Listens to
@@ -484,7 +509,8 @@ what keeps the two paths from double-loading.
   a master can never claim a group is on while a leaf inside it is off.
   `#settings-search` filters by group and item text. Writes land in
   `bt_settings` on every flip; it live-updates from `chrome.storage.onChanged`.
-  **Count contract:** `#settings-list .switch` is exactly the leaves (32) —
+  **Count contract:** `#settings-list .switch` is exactly the leaves (33, of
+  which 32 are checked by default) —
   masters use `.group-toggle` precisely so they don't inflate it. Each switch
   carries **`data-key="<setting>"`** and every test must select through it —
   `nth(11)` and hand-maintained mirrors of the settings order are how adding a
@@ -512,10 +538,12 @@ what keeps the two paths from double-loading.
   `TOMBSTONE_TTL_MS` / `SYNC_KEY`), the gist-sync config block (`SYNC.*` —
   gist filename, poll period, push debounce), and the feature-toggle
   contract — `SETTINGS_KEY` = `bt_settings`, `SETTING_GROUPS` (the two-level
-  toggle tree), `DEFAULT_SETTINGS` (32 leaf booleans, derived from the tree,
-  all `true`), `LEGACY_SETTING_MAP` and `resolveSettings()`. Loaded as a plain script
+  toggle tree), `DEFAULT_SETTINGS` (33 leaf booleans derived from the tree —
+  all `true` bar the opt-in `blockInEmbeds`), `LEGACY_SETTING_MAP` and
+  `resolveSettings()`. Loaded as a plain script
   everywhere (`importScripts` in the service worker, `<script src>` in HTML
-  pages, first entry in `content_scripts.js`) and attaches to `self`.
+  pages, first entry in the manifest's `content_scripts.js` array) and
+  attaches to `self`.
 
 ### Channel block modes
 
@@ -592,9 +620,23 @@ only reads the duration badge (`readDurationSec()` — scans the
 time-status/duration badges specifically, ignoring "4K"/"New") when a bound
 is set, only reads the title from `#video-title` when a keyword exists.
 **JS-scrub only** — CSS can't match text or parse a badge — so there's a
-one-frame window vs the `:has()` layer; `processRenderer()` leaves a
-keyword-relevant tile *unchecked* while its title hasn't hydrated and
-`recheckHydratingTiles()` re-processes those. The options **Keywords** page
+one-frame window vs the `:has()` layer.
+
+**The hydration trap — this silently disabled the length filter entirely.**
+`processRenderer()` marks a tile `data-bt-checked="1"`, and a checked tile is
+*never looked at again*. YouTube mounts the tile before its title and its
+duration badge, so marking it checked too early doesn't delay a filter, it
+turns the filter off. Only the *title* case was treated as pending, so every
+tile got locked in before its badge arrived and `durMinSec`/`durMaxSec` did
+nothing at all on a normal page load (confirmed live: 13 of 13 under-bound
+videos survived). Both are pending now, `recheckHydratingTiles()` re-processes
+them, and its query includes **`LOCKUP_SELECTOR`** — leaving that out meant
+modern search tiles were never re-examined either, which also weakened the
+keyword recheck. `REHYDRATE_MAX_TRIES` bounds the retries so a live stream —
+no duration, ever — isn't re-read for the life of the page; size it against
+the **2s heartbeat**, not the ~400ms throttle, because the throttle only fires
+on DOM mutation and a settled page is driven by the heartbeat alone (at 8
+tries ≈ 16s a 2½-hour video still slipped through). The options **Keywords** page
 tab edits both (title list + a "Block videos by length" block). The gist
 merge carries the whole `keywords` object as last-write-wins on `ts`;
 `kwFingerprint()` (list + duration bounds, ts excluded) in `sameBlocklist()`
@@ -638,6 +680,40 @@ selectors); the JS scrubs (`scrubVideoActions`, `scrubGuide`,
 is a `[unit-spellings-across-~15-languages, days]` table, anchored by the
 preceding `<number>` so a short token can't match inside a word
 (`locale-age-test.mjs` guards it).
+
+### Right-click to block
+
+`background.js` registers two `chrome.contextMenus` items on youtube.com
+(`documentUrlPatterns`), created in `onInstalled` via `setUpContextMenus()`:
+"block this channel" and "block this video".
+
+A menu item cannot inspect what you right-clicked *before* it is shown, so
+both always appear and `ctxTargetFrom(info)` works out the target on click
+from `info.linkUrl || info.srcUrl || info.pageUrl` — the link under the
+cursor deliberately wins over the page, so right-clicking a tile on a watch
+page blocks the tile and not what you are watching. It understands the same
+URL shapes the nav guard does. **`/c/…` and `/user/…` name neither identity
+format and are reported as unresolvable rather than guessed at** — blocking
+the wrong channel is far worse than doing nothing.
+
+"Block this channel" on a *video* link has no channel in the URL, so it
+falls back to `resolveVideoChannel()` — the same cached oEmbed lookup the
+`/embed/` guard uses. Blocks are stored with an empty name and
+`enrichChannelIdentity()` fills in the real name and the other identity
+format afterwards, exactly as a popup block does.
+
+Feedback goes through `MSG.SHOW_TOAST` to the content script (a
+`<bt-toast>` with inline styles, so no stylesheet — ours or YouTube's — can
+affect it, and it matches none of our own scrub selectors). That is
+deliberate: the alternative, `chrome.notifications`, would add an
+install-time permission prompt for the sake of a one-line confirmation. A
+toast is also the only way to report the unresolvable cases above, since the
+thing you right-clicked is often not visibly affected.
+
+`contextmenu-test` lifts `ctxTargetFrom()` and its regexes straight out of
+`background.js` and runs them in pure Node — a native context menu can't be
+opened from Playwright, but the part that can actually be wrong is working
+out *what* was clicked.
 
 ### Debug mode
 
@@ -806,21 +882,27 @@ rewrite, not a tweak here.
   videos are fully reachable there. Adding it is not a one-line manifest
   edit — YouTube Music's DOM shares almost nothing with the `ytd-*` tags
   `RENDERER_SELECTOR` targets.
-- **Not covered: third-party embeds.** The content script has no
-  `all_frames`, and the DNR rules are `resourceTypes: ["main_frame"]`, so a
-  blocked video embedded in an `<iframe>` on someone else's site plays. A
-  top-level `youtube.com/embed/<id>` *is* handled (via
-  `MSG.RESOLVE_VIDEO_CHANNEL`). Extending to iframes means `all_frames: true`
-  plus `sub_frame` in the DNR conditions — deliberately not done, since it
-  changes behaviour on every site the user visits, not just YouTube.
+- **Third-party embeds are opt-in** (`blockInEmbeds`, the only leaf that ships
+  OFF). `content_scripts.all_frames` is `true`, but `matches` is still
+  youtube.com only — so this injects into YouTube iframes, not into every
+  frame on the web. The frame path in `content.js` **returns before any of the
+  observers, stylesheets and timers are set up**; only a real `/embed/<id>`
+  does any work, and only when the switch is on. Keep that early return first:
+  the full init running in every embed on a page full of them is exactly the
+  cost this design avoids. An embed can only be neutered from the inside —
+  there is no content script on the host page, so the `<iframe>` element itself
+  can't be removed and blanking the frame is the honest most we can do. DNR
+  gets a second rule per blocked video id at `DNR_RULE_ID_BASE_EMBED` with
+  `resourceTypes: ["sub_frame"]` and action **`block`**, not the redirect the
+  top-level rules use: sending someone else's embedded player to our
+  Subscriptions feed would be a stranger surprise than an empty frame.
 - `MSG.RESOLVE_VIDEO_CHANNEL` depends on YouTube's public **oEmbed** endpoint
   (`/oembed?format=json&url=…`, no API key) staying available and returning
   `author_url`. It is only consulted for a page that shows a player but no
   channel byline (in practice `/embed/<id>`), and misses are cached, so a
   breakage degrades to "embed pages stop being guarded", not an error.
-- `manifest.json` declares the `contextMenus` permission, but nothing calls
-  `chrome.contextMenus.*` anywhere — it's a leftover. Safe to drop, or to
-  build the right-click "block this" entry it was presumably reserved for.
+- The `contextMenus` permission is now actually used — see "Right-click to
+  block". It had been declared for years with no call behind it.
 - `background/gist-sync.js` assumes the GitHub REST shape (`/gists`,
   `/gists/:id`, `history[0].version`) and that the account's BlockTube gist
   is on page 1 of `/gists?per_page=100` (true right after creation; a user
@@ -891,6 +973,38 @@ rewrite, not a tweak here.
   test account exists or should be improvised here). `GUIDE_FOOTER_SIGNAL_RE`
   (matching on footer link text like "How YouTube works") is the equivalent
   fragility point for the sidebar's small-print footer removal.
+- **A feed where everything is blocked will loop forever without
+  `curbRunawayFeed()`.** YouTube fetches the next page of an infinite feed
+  while its continuation sentinel is in the viewport, assuming what it just
+  added made the page taller. Suppress every tile and the height never changes,
+  so it fetches again immediately. Measured on a video-only-blocked channel's
+  `/videos` tab, sitting still and never scrolling: **22 continuation requests
+  in 30s** (0 with the extension off), 221k nodes added, tiles 210 → 510 → 690
+  against a document height pinned at 1388px, **77% CPU and long tasks up to
+  1.5s** — which is what makes the whole machine stop responding to typing. It
+  does not settle; it ends when the tab dies.
+
+  Two things that look like fixes and are not:
+  1. **Removing the sentinel** — YouTube re-creates it and asks again (still 21
+     requests in 30s).
+  2. **Testing whether the page can scroll** — a blocked channel page still
+     scrolls by the height of its masthead and header (1388px against a 1000px
+     viewport), so that test passes while the feed underneath loops.
+
+  What works is matching YouTube's actual trigger: curb when the sentinel is
+  **within ~1.5 viewports** and this page view has had `CURB_MIN_SUPPRESSED`
+  tiles taken away. Then remove the sentinel *and* insert the
+  `<bt-blocked-notice>` — the notice's `min-height` is load-bearing, not
+  decoration, because the page has to become taller than the viewport for a
+  re-created sentinel to fall out of range. After the fix: 0 requests, 1% CPU,
+  no long tasks.
+
+  The count is of **removals, not surviving tiles** (`notePageSuppressed()`,
+  reset per page view). A tile-based test cannot work here: the curb removes
+  the tiles, so the next pass would have nothing left to count and would stop
+  recognising the state it just created. `feedloop-test` guards both directions
+  — the loop stopping, and an unblocked or partially-blocked feed still paging
+  normally, since over-correcting here would break scrolling everywhere.
 - Everything except `processRenderer()`'s blocklist removals runs on the
   ~400ms `scheduleExtrasScrub()` throttle (see Architecture) — a small
   latency window traded for page-load performance. Anything that must
